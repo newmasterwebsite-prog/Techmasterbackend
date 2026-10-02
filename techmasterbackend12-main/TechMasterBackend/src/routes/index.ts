@@ -73,7 +73,7 @@ import {
 
 const router = Router();
 
-// Public endpoint for submitting a resume/career application
+// Public endpoint for submitting a resume/career application (Direct MongoDB PDF Base64 storage)
 const handleResumeSubmission = async (req: any, res: any, next: any) => {
   try {
     const { name, candidateName, fullName, email, phone, jobTitle, role, position, experience, portfolioLink, message, whyJoin, coverLetter } = req.body;
@@ -81,35 +81,21 @@ const handleResumeSubmission = async (req: any, res: any, next: any) => {
     let downloadUrl = "";
     let base64Data = "";
     let publicId = "";
-    let cloudinaryUrl = "";
+    let fileName = "resume.pdf";
     
     if (req.file) {
-      const origName = req.file.originalname || "resume.pdf";
+      fileName = req.file.originalname || "resume.pdf";
       const mimeType = req.file.mimetype || "application/pdf";
-      const ext = path.extname(origName) || ".pdf";
-      const baseName = path.basename(origName, ext).replace(/[^a-zA-Z0-9_-]/g, "_");
+      const ext = path.extname(fileName) || ".pdf";
+      const baseName = path.basename(fileName, ext).replace(/[^a-zA-Z0-9_-]/g, "_");
       const uniqueFileName = `${baseName}_${Date.now()}${ext}`;
 
+      // Save complete uploaded document binary directly as Base64 data URI in MongoDB
       base64Data = `data:${mimeType};base64,${req.file.buffer.toString("base64")}`;
       publicId = uniqueFileName;
       downloadUrl = `/api/v1/resumes/download?id=${resumeId}&file=${encodeURIComponent(uniqueFileName)}`;
 
-      // 1. Upload to Cloudinary for CDN storage
-      try {
-        const uploadResult = await CloudinaryService.uploadBuffer(
-          req.file.buffer,
-          "techmaster/resumes",
-          "auto",
-          { public_id: uniqueFileName, resource_type: "auto" }
-        );
-        if (uploadResult && uploadResult.secure_url) {
-          cloudinaryUrl = uploadResult.secure_url;
-        }
-      } catch (cloudErr: any) {
-        console.warn("Cloudinary resume upload note:", cloudErr?.message || cloudErr);
-      }
-
-      // 2. Local filesystem backup
+      // Local filesystem backup
       try {
         const resumesDir = path.join(process.cwd(), "uploads", "resumes");
         if (!fs.existsSync(resumesDir)) {
@@ -119,7 +105,7 @@ const handleResumeSubmission = async (req: any, res: any, next: any) => {
       } catch (e) {}
     }
 
-    // Append to CMSData 'resumes' and 'careerApplications' array
+    // Append to CMSData 'resumes' and 'careerApplications' in MongoDB
     const doc = await CMSData.findOne({ key: "resumes" });
     let resumes = [];
     if (doc && Array.isArray(doc.value)) {
@@ -146,18 +132,17 @@ const handleResumeSubmission = async (req: any, res: any, next: any) => {
       message: message || whyJoin || "",
       whyJoin: message || whyJoin || "",
       coverLetter: coverLetter || "",
-      resumeFileUrl: cloudinaryUrl || downloadUrl || "",
-      resumeUrl: cloudinaryUrl || downloadUrl || "",
-      cloudinaryUrl: cloudinaryUrl || "",
-      resumeBase64Data: base64Data || "",
-      resumeFileName: req.file?.originalname || 'resume.pdf',
+      resumeFileUrl: downloadUrl || "",
+      resumeUrl: downloadUrl || "",
+      resumeBase64Data: base64Data || "", // Directly stored in MongoDB
+      resumeFileName: fileName,
       publicId: publicId,
       status: "New",
       date: new Date().toISOString().split('T')[0],
       createdAt: new Date().toISOString()
     };
 
-    // Save full applicant record (including base64 buffer in MongoDB so Render ephemeral disk never loses it)
+    // Store in DB array
     resumes.unshift(newResume);
 
     await CMSData.findOneAndUpdate(
@@ -172,7 +157,7 @@ const handleResumeSubmission = async (req: any, res: any, next: any) => {
       { upsert: true, new: true }
     );
 
-    // Return sanitized resume object in response (omits huge base64 from client payload)
+    // Return sanitized resume in response without heavy base64
     const sanitizedResumeForList = { ...newResume };
     delete (sanitizedResumeForList as any).resumeBase64Data;
 
@@ -291,14 +276,14 @@ router.delete("/public/resume/:id", handleDeleteResume);
 router.delete("/career-application/:id", handleDeleteResume);
 router.delete("/applications/:id", handleDeleteResume);
 
-// Proxy & direct file downloader for candidate resumes (PDF, DOCX, PPT, Base64, Cloudinary, Local)
+// Direct DB Base64 / Local file downloader for resumes (PDF, DOCX, PPT)
 const handleResumeDownload = async (req: any, res: any) => {
   try {
     let rawUrl = (req.query.url as string) || (req.query.file as string) || "";
     let downloadFileName = (req.query.filename as string) || (req.query.name as string) || "";
     let id = (req.query.id as string) || "";
 
-    // Parse parameters if rawUrl is a relative query string e.g. "/api/v1/resumes/download?id=...&file=..."
+    // Parse parameters if rawUrl is a query string e.g. "/api/v1/resumes/download?id=...&file=..."
     if (rawUrl.includes("?") || rawUrl.includes("id=") || rawUrl.includes("file=")) {
       try {
         const dummyUrl = new URL(rawUrl.startsWith("http") ? rawUrl : `http://localhost${rawUrl.startsWith("/") ? "" : "/"}${rawUrl}`);
@@ -324,7 +309,7 @@ const handleResumeDownload = async (req: any, res: any) => {
       downloadFileName = "candidate_resume.pdf";
     }
 
-    // 1. Search applicant across CMSData collections
+    // 1. Search applicant across CMSData MongoDB collections
     let applicant: any = null;
     const cmsKeys = ["resumes", "careerApplications", "careersCMS", "careersPage"];
     for (const key of cmsKeys) {
@@ -340,25 +325,24 @@ const handleResumeDownload = async (req: any, res: any) => {
         }
 
         if (id) {
+          const cleanId = String(id).trim().toLowerCase();
           applicant = list.find((r: any) => 
             r && (
-              r.id === id || 
-              r._id === id || 
-              String(r.id).toLowerCase() === String(id).toLowerCase() || 
-              String(r._id).toLowerCase() === String(id).toLowerCase() ||
-              r.publicId === id
+              String(r.id || "").trim().toLowerCase() === cleanId || 
+              String(r._id || "").trim().toLowerCase() === cleanId || 
+              String(r.publicId || "").trim().toLowerCase() === cleanId
             )
           );
         }
 
         if (!applicant && (downloadFileName || req.query.file)) {
-          const matchTarget = req.query.file || downloadFileName;
+          const matchTarget = String(req.query.file || downloadFileName).trim().toLowerCase();
           applicant = list.find((r: any) => 
             r && (
-              r.resumeFileName === matchTarget || 
-              r.publicId === matchTarget ||
-              (r.resumeUrl && r.resumeUrl.includes(matchTarget)) ||
-              (r.resumeFileUrl && r.resumeFileUrl.includes(matchTarget))
+              String(r.resumeFileName || "").trim().toLowerCase() === matchTarget || 
+              String(r.publicId || "").trim().toLowerCase() === matchTarget ||
+              (r.resumeUrl && String(r.resumeUrl).toLowerCase().includes(matchTarget)) ||
+              (r.resumeFileUrl && String(r.resumeFileUrl).toLowerCase().includes(matchTarget))
             )
           );
         }
@@ -367,69 +351,39 @@ const handleResumeDownload = async (req: any, res: any) => {
       } catch (e) {}
     }
 
-    if (applicant) {
-      if (applicant.resumeFileName && (!downloadFileName || downloadFileName === "candidate_resume.pdf")) {
-        downloadFileName = applicant.resumeFileName;
-      }
+    if (applicant && applicant.resumeFileName && (!downloadFileName || downloadFileName === "candidate_resume.pdf")) {
+      downloadFileName = applicant.resumeFileName;
     }
 
-    // Determine target candidate URLs/data
-    const dataCandidate = applicant?.resumeBase64Data || (rawUrl.startsWith("data:") ? rawUrl : "");
-    const cloudCandidate = applicant?.cloudinaryUrl || 
-      (applicant?.resumeUrl && applicant.resumeUrl.startsWith("http") ? applicant.resumeUrl : "") ||
-      (applicant?.resumeFileUrl && applicant.resumeFileUrl.startsWith("http") ? applicant.resumeFileUrl : "") ||
-      (rawUrl.startsWith("http") ? rawUrl : "");
+    // 2. Extract Base64 binary from MongoDB document
+    const base64Candidate = applicant?.resumeBase64Data || 
+      applicant?.resume || 
+      applicant?.fileData || 
+      (applicant?.resumeUrl && applicant.resumeUrl.startsWith("data:") ? applicant.resumeUrl : "") ||
+      (applicant?.resumeFileUrl && applicant.resumeFileUrl.startsWith("data:") ? applicant.resumeFileUrl : "") ||
+      (rawUrl.startsWith("data:") ? rawUrl : "");
 
-    // 2. Serve from Base64 Data URI if available (original document binary)
-    if (dataCandidate && dataCandidate.startsWith("data:")) {
-      const matches = dataCandidate.match(/^data:(.*?);base64,(.*)$/);
-      if (matches && matches.length === 3) {
-        const mimeType = matches[1] || "application/pdf";
-        const buffer = Buffer.from(matches[2], "base64");
-        res.setHeader("Content-Type", mimeType);
-        res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(downloadFileName)}"`);
-        return res.send(buffer);
-      }
-    }
+    if (base64Candidate) {
+      let mimeType = "application/pdf";
+      let base64String = base64Candidate;
 
-    // 3. Serve from Cloudinary / Remote HTTP(S) URL if available (original uploaded file)
-    if (cloudCandidate && (cloudCandidate.startsWith("http://") || cloudCandidate.startsWith("https://"))) {
-      let response: any = null;
-      try {
-        response = await fetch(cloudCandidate);
-      } catch (e) {}
-
-      if ((!response || !response.ok) && cloudCandidate.includes("cloudinary.com")) {
-        const fallbacks: string[] = [];
-        if (cloudCandidate.endsWith(".pdf")) {
-          fallbacks.push(cloudCandidate.slice(0, -4));
-        }
-        if (!cloudCandidate.includes(".")) {
-          fallbacks.push(`${cloudCandidate}.pdf`);
-        }
-        for (const altUrl of fallbacks) {
-          try {
-            const altResp = await fetch(altUrl);
-            if (altResp.ok) {
-              response = altResp;
-              break;
-            }
-          } catch (e) {}
+      if (base64Candidate.startsWith("data:")) {
+        const matches = base64Candidate.match(/^data:([^;]+);base64,(.*)$/);
+        if (matches && matches.length === 3) {
+          mimeType = matches[1];
+          base64String = matches[2];
+        } else {
+          base64String = base64Candidate.split(",")[1] || base64Candidate;
         }
       }
 
-      if (response && response.ok) {
-        const arrayBuffer = await response.arrayBuffer();
-        const buffer = Buffer.from(arrayBuffer);
-        const contentType = response.headers.get("content-type") || "application/octet-stream";
-
-        res.setHeader("Content-Type", contentType);
-        res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(downloadFileName)}"`);
-        return res.send(buffer);
-      }
+      const buffer = Buffer.from(base64String, "base64");
+      res.setHeader("Content-Type", mimeType);
+      res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(downloadFileName)}"`);
+      return res.send(buffer);
     }
 
-    // 4. Serve from local filesystem if original file exists on disk
+    // 3. Fallback to local filesystem if file exists on disk
     const fileCandidates: string[] = [];
     if (req.query.file) fileCandidates.push(String(req.query.file));
     if (downloadFileName) fileCandidates.push(downloadFileName);
