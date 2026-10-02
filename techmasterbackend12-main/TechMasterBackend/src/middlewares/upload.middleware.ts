@@ -24,4 +24,29 @@ export const parseMultipleImages = handleMulterError(uploadImage.array("files", 
 export const parseSingleVideo = handleMulterError(uploadVideo.single("file"));
 export const parseMultipleVideos = handleMulterError(uploadVideo.array("files", 5));
 export const parseAnyMedia = handleMulterError(uploadVideo.single("file")); // accepts either, video config sets max limit (100MB)
-export const parseDocument = handleMulterError(uploadDocument.single("resume"));
+
+const documentFieldsHandler = handleMulterError(
+  uploadDocument.fields([
+    { name: "resume", maxCount: 1 },
+    { name: "file", maxCount: 1 },
+    { name: "document", maxCount: 1 },
+  ])
+);
+
+export const parseDocument = (req: any, res: any, next: any) => {
+  documentFieldsHandler(req, res, (err: any) => {
+    if (err) return next(err);
+    const files = req.files;
+    if (files) {
+      if (files["resume"] && files["resume"][0]) {
+        req.file = files["resume"][0];
+      } else if (files["file"] && files["file"][0]) {
+        req.file = files["file"][0];
+      } else if (files["document"] && files["document"][0]) {
+        req.file = files["document"][0];
+      }
+    }
+    next();
+  });
+};
+

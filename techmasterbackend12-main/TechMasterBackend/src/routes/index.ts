@@ -81,6 +81,7 @@ const handleResumeSubmission = async (req: any, res: any, next: any) => {
     let downloadUrl = "";
     let base64Data = "";
     let publicId = "";
+    let cloudinaryUrl = "";
     
     if (req.file) {
       const origName = req.file.originalname || "resume.pdf";
@@ -93,7 +94,22 @@ const handleResumeSubmission = async (req: any, res: any, next: any) => {
       publicId = uniqueFileName;
       downloadUrl = `/api/v1/resumes/download?id=${resumeId}&file=${encodeURIComponent(uniqueFileName)}`;
 
-      // Optional local filesystem backup
+      // 1. Upload to Cloudinary for CDN storage
+      try {
+        const uploadResult = await CloudinaryService.uploadBuffer(
+          req.file.buffer,
+          "techmaster/resumes",
+          "auto",
+          { public_id: uniqueFileName, resource_type: "auto" }
+        );
+        if (uploadResult && uploadResult.secure_url) {
+          cloudinaryUrl = uploadResult.secure_url;
+        }
+      } catch (cloudErr: any) {
+        console.warn("Cloudinary resume upload note:", cloudErr?.message || cloudErr);
+      }
+
+      // 2. Local filesystem backup
       try {
         const resumesDir = path.join(process.cwd(), "uploads", "resumes");
         if (!fs.existsSync(resumesDir)) {
@@ -130,8 +146,9 @@ const handleResumeSubmission = async (req: any, res: any, next: any) => {
       message: message || whyJoin || "",
       whyJoin: message || whyJoin || "",
       coverLetter: coverLetter || "",
-      resumeFileUrl: downloadUrl || "",
-      resumeUrl: downloadUrl || "",
+      resumeFileUrl: cloudinaryUrl || downloadUrl || "",
+      resumeUrl: cloudinaryUrl || downloadUrl || "",
+      cloudinaryUrl: cloudinaryUrl || "",
       resumeBase64Data: base64Data || "",
       resumeFileName: req.file?.originalname || 'resume.pdf',
       publicId: publicId,
@@ -140,11 +157,8 @@ const handleResumeSubmission = async (req: any, res: any, next: any) => {
       createdAt: new Date().toISOString()
     };
 
-    // Store sanitized resume object without heavy base64 in the main array
-    const sanitizedResumeForList = { ...newResume };
-    delete (sanitizedResumeForList as any).resumeBase64Data;
-
-    resumes.unshift(sanitizedResumeForList); // Add to top
+    // Save full applicant record (including base64 buffer in MongoDB so Render ephemeral disk never loses it)
+    resumes.unshift(newResume);
 
     await CMSData.findOneAndUpdate(
       { key: "resumes" },
@@ -157,6 +171,10 @@ const handleResumeSubmission = async (req: any, res: any, next: any) => {
       { value: resumes },
       { upsert: true, new: true }
     );
+
+    // Return sanitized resume object in response (omits huge base64 from client payload)
+    const sanitizedResumeForList = { ...newResume };
+    delete (sanitizedResumeForList as any).resumeBase64Data;
 
     ApiResponse.success(res, "Resume submitted successfully", sanitizedResumeForList);
   } catch (error) {
@@ -273,44 +291,170 @@ router.delete("/public/resume/:id", handleDeleteResume);
 router.delete("/career-application/:id", handleDeleteResume);
 router.delete("/applications/:id", handleDeleteResume);
 
-// Proxy & direct local file downloader for resumes (PDF, DOCX, PPT, etc.)
+// Helper to generate a clean PDF summary if legacy resume file was wiped on ephemeral server storage
+const generateApplicationSummaryPdf = (applicant: any): Buffer => {
+  const name = applicant.name || applicant.candidateName || applicant.fullName || "Candidate";
+  const email = applicant.email || "N/A";
+  const phone = applicant.phone || "N/A";
+  const position = applicant.jobTitle || applicant.jobApplied || applicant.position || applicant.role || "General Application";
+  const date = applicant.date || (applicant.createdAt ? applicant.createdAt.split("T")[0] : new Date().toISOString().split("T")[0]);
+  const experience = applicant.experience || applicant.portfolioUrl || applicant.portfolioLink || "N/A";
+  const message = applicant.message || applicant.whyJoin || "N/A";
+  const coverLetter = applicant.coverLetter || "";
+
+  const clean = (str: any) => String(str || "").replace(/[()\\\r\n]/g, " ").substring(0, 150);
+
+  const lines = [
+    { text: "TECHMASTER - CANDIDATE APPLICATION SUMMARY", size: 16, bold: true, dy: 30 },
+    { text: "------------------------------------------------------------------------------------------------", size: 10, bold: false, dy: 15 },
+    { text: "Candidate Name: " + clean(name), size: 12, bold: true, dy: 20 },
+    { text: "Applied Position: " + clean(position), size: 11, bold: false, dy: 18 },
+    { text: "Email Address: " + clean(email), size: 11, bold: false, dy: 18 },
+    { text: "Phone Number: " + clean(phone), size: 11, bold: false, dy: 18 },
+    { text: "Submission Date: " + clean(date), size: 11, bold: false, dy: 18 },
+    { text: "Portfolio / Profile: " + clean(experience), size: 11, bold: false, dy: 25 },
+    { text: "WHY JOIN / CANDIDATE STATEMENT:", size: 12, bold: true, dy: 20 },
+    { text: clean(message), size: 10, bold: false, dy: 25 },
+  ];
+
+  if (coverLetter && clean(coverLetter) !== "N/A") {
+    lines.push({ text: "COVER LETTER:", size: 12, bold: true, dy: 20 });
+    lines.push({ text: clean(coverLetter), size: 10, bold: false, dy: 20 });
+  }
+
+  let textStream = "BT\n";
+  let currentY = 730;
+  for (const item of lines) {
+    const font = item.bold ? "/F2" : "/F1";
+    textStream += font + " " + item.size + " Tf\n";
+    textStream += "50 " + currentY + " Td\n";
+    textStream += "(" + item.text.replace(/[()]/g, "") + ") Tj\n";
+    textStream += "ET\nBT\n";
+    currentY -= item.dy;
+  }
+  textStream += "ET";
+
+  const streamLen = Buffer.byteLength(textStream, "utf-8");
+
+  const objects = [
+    "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+    "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+    "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> >>\nendobj\n",
+    "4 0 obj\n<< /Length " + streamLen + " >>\nstream\n" + textStream + "\nendstream\nendobj\n",
+    "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+    "6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>\nendobj\n"
+  ];
+
+  let pdf = "%PDF-1.4\n";
+  const offsets = [0];
+  for (const obj of objects) {
+    offsets.push(Buffer.byteLength(pdf, "utf-8"));
+    pdf += obj;
+  }
+  const xrefOffset = Buffer.byteLength(pdf, "utf-8");
+  pdf += "xref\n0 7\n0000000000 65535 f \n";
+  for (let i = 1; i <= 6; i++) {
+    pdf += String(offsets[i]).padStart(10, "0") + " 00000 n \n";
+  }
+  pdf += "trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n" + xrefOffset + "\n%%EOF\n";
+
+  return Buffer.from(pdf, "utf-8");
+};
+
+// Proxy & direct file downloader for candidate resumes (PDF, DOCX, PPT, Base64, Cloudinary, Local, Dynamic fallback)
 const handleResumeDownload = async (req: any, res: any) => {
   try {
     let rawUrl = (req.query.url as string) || (req.query.file as string) || "";
-    let downloadFileName = (req.query.filename as string) || "candidate_resume.pdf";
-    const id = req.query.id as string;
+    let downloadFileName = (req.query.filename as string) || (req.query.name as string) || "";
+    let id = (req.query.id as string) || "";
 
-    // 0. Handle lookup by applicant ID first
-    if (id) {
-      const doc = await CMSData.findOne({ key: "resumes" });
-      const resumes = doc && Array.isArray(doc.value) ? doc.value : [];
-      const applicant = resumes.find((r: any) => r.id === id || r._id === id);
-      if (applicant) {
-        if (applicant.resumeFileName) downloadFileName = applicant.resumeFileName;
-        const targetUrl = applicant.resumeBase64Data || applicant.resumeUrl || applicant.resumeFileUrl || "";
-        if (targetUrl.startsWith("data:")) {
-          const matches = targetUrl.match(/^data:(.*?);base64,(.*)$/);
-          if (matches && matches.length === 3) {
-            const mimeType = matches[1];
-            const buffer = Buffer.from(matches[2], "base64");
-            res.setHeader("Content-Type", mimeType);
-            res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(downloadFileName)}"`);
-            return res.send(buffer);
-          }
+    // Parse parameters if rawUrl is a relative query string e.g. "/api/v1/resumes/download?id=...&file=..."
+    if (rawUrl.includes("?") || rawUrl.includes("id=") || rawUrl.includes("file=")) {
+      try {
+        const dummyUrl = new URL(rawUrl.startsWith("http") ? rawUrl : `http://localhost${rawUrl.startsWith("/") ? "" : "/"}${rawUrl}`);
+        if (!id && dummyUrl.searchParams.get("id")) {
+          id = dummyUrl.searchParams.get("id") || "";
         }
-        if (!rawUrl && targetUrl) rawUrl = targetUrl;
+        if (!downloadFileName && (dummyUrl.searchParams.get("filename") || dummyUrl.searchParams.get("file"))) {
+          downloadFileName = dummyUrl.searchParams.get("filename") || dummyUrl.searchParams.get("file") || "";
+        }
+      } catch (e) {
+        if (!id) {
+          const idMatch = rawUrl.match(/[?&]id=([^&]+)/);
+          if (idMatch) id = decodeURIComponent(idMatch[1]);
+        }
+        if (!downloadFileName) {
+          const fileMatch = rawUrl.match(/[?&](?:filename|file)=([^&]+)/);
+          if (fileMatch) downloadFileName = decodeURIComponent(fileMatch[1]);
+        }
       }
     }
 
-    if (!rawUrl) {
-      return res.status(400).json({ success: false, message: "Missing resume file parameter" });
+    if (!downloadFileName) {
+      downloadFileName = "candidate_resume.pdf";
     }
 
-    // 1. Handle Base64 Data URIs directly
-    if (rawUrl.startsWith("data:")) {
-      const matches = rawUrl.match(/^data:(.*?);base64,(.*)$/);
+    // 1. Search applicant across CMSData collections
+    let applicant: any = null;
+    const cmsKeys = ["resumes", "careerApplications", "careersCMS", "careersPage"];
+    for (const key of cmsKeys) {
+      try {
+        const doc = await CMSData.findOne({ key });
+        let list: any[] = [];
+        if (doc && Array.isArray(doc.value)) {
+          list = doc.value;
+        } else if (doc && doc.value && typeof doc.value === "object") {
+          const obj = doc.value as any;
+          if (Array.isArray(obj.resumes)) list = obj.resumes;
+          else if (Array.isArray(obj.applications)) list = obj.applications;
+        }
+
+        if (id) {
+          applicant = list.find((r: any) => 
+            r && (
+              r.id === id || 
+              r._id === id || 
+              String(r.id).toLowerCase() === String(id).toLowerCase() || 
+              String(r._id).toLowerCase() === String(id).toLowerCase() ||
+              r.publicId === id
+            )
+          );
+        }
+
+        if (!applicant && (downloadFileName || req.query.file)) {
+          const matchTarget = req.query.file || downloadFileName;
+          applicant = list.find((r: any) => 
+            r && (
+              r.resumeFileName === matchTarget || 
+              r.publicId === matchTarget ||
+              (r.resumeUrl && r.resumeUrl.includes(matchTarget)) ||
+              (r.resumeFileUrl && r.resumeFileUrl.includes(matchTarget))
+            )
+          );
+        }
+
+        if (applicant) break;
+      } catch (e) {}
+    }
+
+    if (applicant) {
+      if (applicant.resumeFileName && (!downloadFileName || downloadFileName === "candidate_resume.pdf")) {
+        downloadFileName = applicant.resumeFileName;
+      }
+    }
+
+    // Determine target candidate URLs/data
+    const dataCandidate = applicant?.resumeBase64Data || (rawUrl.startsWith("data:") ? rawUrl : "");
+    const cloudCandidate = applicant?.cloudinaryUrl || 
+      (applicant?.resumeUrl && applicant.resumeUrl.startsWith("http") ? applicant.resumeUrl : "") ||
+      (applicant?.resumeFileUrl && applicant.resumeFileUrl.startsWith("http") ? applicant.resumeFileUrl : "") ||
+      (rawUrl.startsWith("http") ? rawUrl : "");
+
+    // 2. Serve from Base64 Data URI if available
+    if (dataCandidate && dataCandidate.startsWith("data:")) {
+      const matches = dataCandidate.match(/^data:(.*?);base64,(.*)$/);
       if (matches && matches.length === 3) {
-        const mimeType = matches[1];
+        const mimeType = matches[1] || "application/pdf";
         const buffer = Buffer.from(matches[2], "base64");
         res.setHeader("Content-Type", mimeType);
         res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(downloadFileName)}"`);
@@ -318,58 +462,78 @@ const handleResumeDownload = async (req: any, res: any) => {
       }
     }
 
-    // 2. Check local uploads folder first for local resume files (/uploads/resumes/...)
-    const cleanFileName = path.basename(rawUrl);
-    const localPath = path.join(process.cwd(), "uploads", "resumes", cleanFileName);
+    // 3. Serve from Cloudinary / Remote HTTP(S) URL if available
+    if (cloudCandidate && (cloudCandidate.startsWith("http://") || cloudCandidate.startsWith("https://"))) {
+      let response: any = null;
+      try {
+        response = await fetch(cloudCandidate);
+      } catch (e) {}
 
-    if (fs.existsSync(localPath)) {
-      res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(downloadFileName)}"`);
-      return res.sendFile(localPath);
-    }
+      if ((!response || !response.ok) && cloudCandidate.includes("cloudinary.com")) {
+        const fallbacks: string[] = [];
+        if (cloudCandidate.endsWith(".pdf")) {
+          fallbacks.push(cloudCandidate.slice(0, -4));
+        }
+        if (!cloudCandidate.includes(".")) {
+          fallbacks.push(`${cloudCandidate}.pdf`);
+        }
+        for (const altUrl of fallbacks) {
+          try {
+            const altResp = await fetch(altUrl);
+            if (altResp.ok) {
+              response = altResp;
+              break;
+            }
+          } catch (e) {}
+        }
+      }
 
-    // Also check if rawUrl has full relative path inside process.cwd()
-    if (rawUrl.startsWith("/uploads/")) {
-      const fullRelativePath = path.join(process.cwd(), rawUrl);
-      if (fs.existsSync(fullRelativePath)) {
+      if (response && response.ok) {
+        const arrayBuffer = await response.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+        const contentType = response.headers.get("content-type") || "application/octet-stream";
+
+        res.setHeader("Content-Type", contentType);
         res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(downloadFileName)}"`);
-        return res.sendFile(fullRelativePath);
+        return res.send(buffer);
       }
     }
 
-    // 3. Fallback for legacy Cloudinary resume URLs
-    let response: any = null;
-    try {
-      response = await fetch(rawUrl);
-    } catch (e) {}
+    // 4. Serve from local filesystem if file exists on disk
+    const fileCandidates: string[] = [];
+    if (req.query.file) fileCandidates.push(String(req.query.file));
+    if (downloadFileName) fileCandidates.push(downloadFileName);
+    if (applicant?.publicId) fileCandidates.push(applicant.publicId);
+    if (applicant?.resumeFileName) fileCandidates.push(applicant.resumeFileName);
+    if (rawUrl && !rawUrl.startsWith("data:") && !rawUrl.startsWith("http")) {
+      const clean = rawUrl.split("?")[0];
+      fileCandidates.push(path.basename(clean));
+    }
 
-    if ((!response || !response.ok) && rawUrl.includes("cloudinary.com")) {
-      const fallbackCandidates: string[] = [];
-      if (rawUrl.endsWith(".pdf")) {
-        fallbackCandidates.push(rawUrl.slice(0, -4));
-      }
-      if (!rawUrl.includes(".")) {
-        fallbackCandidates.push(`${rawUrl}.pdf`);
-      }
+    for (const fName of fileCandidates) {
+      if (!fName) continue;
+      const cleanName = path.basename(fName);
+      const possiblePaths = [
+        path.join(process.cwd(), "uploads", "resumes", cleanName),
+        path.join(process.cwd(), "uploads", cleanName),
+        path.join(process.cwd(), cleanName)
+      ];
 
-      for (const altUrl of fallbackCandidates) {
-        try {
-          const altResp = await fetch(altUrl);
-          if (altResp.ok) {
-            response = altResp;
-            break;
-          }
-        } catch (e) {}
+      for (const p of possiblePaths) {
+        if (fs.existsSync(p) && fs.statSync(p).isFile()) {
+          res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(downloadFileName)}"`);
+          return res.sendFile(p);
+        }
       }
     }
 
-    if (response && response.ok) {
-      const arrayBuffer = await response.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
-      const contentType = response.headers.get("content-type") || "application/octet-stream";
-
-      res.setHeader("Content-Type", contentType);
-      res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(downloadFileName)}"`);
-      return res.send(buffer);
+    // 5. If applicant exists in DB but physical file was wiped on ephemeral storage (Render), generate summary PDF on the fly
+    if (applicant && (applicant.name || applicant.candidateName || applicant.email)) {
+      const pdfBuffer = generateApplicationSummaryPdf(applicant);
+      const pdfFileName = downloadFileName.endsWith(".pdf") ? downloadFileName : `${downloadFileName}.pdf`;
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(pdfFileName)}"`);
+      return res.send(pdfBuffer);
     }
 
     return res.status(404).json({ success: false, message: "Resume file not found on server storage" });
