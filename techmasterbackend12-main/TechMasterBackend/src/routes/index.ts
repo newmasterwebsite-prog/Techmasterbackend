@@ -291,77 +291,7 @@ router.delete("/public/resume/:id", handleDeleteResume);
 router.delete("/career-application/:id", handleDeleteResume);
 router.delete("/applications/:id", handleDeleteResume);
 
-// Helper to generate a clean PDF summary if legacy resume file was wiped on ephemeral server storage
-const generateApplicationSummaryPdf = (applicant: any): Buffer => {
-  const name = applicant.name || applicant.candidateName || applicant.fullName || "Candidate";
-  const email = applicant.email || "N/A";
-  const phone = applicant.phone || "N/A";
-  const position = applicant.jobTitle || applicant.jobApplied || applicant.position || applicant.role || "General Application";
-  const date = applicant.date || (applicant.createdAt ? applicant.createdAt.split("T")[0] : new Date().toISOString().split("T")[0]);
-  const experience = applicant.experience || applicant.portfolioUrl || applicant.portfolioLink || "N/A";
-  const message = applicant.message || applicant.whyJoin || "N/A";
-  const coverLetter = applicant.coverLetter || "";
-
-  const clean = (str: any) => String(str || "").replace(/[()\\\r\n]/g, " ").substring(0, 150);
-
-  const lines = [
-    { text: "TECHMASTER - CANDIDATE APPLICATION SUMMARY", size: 16, bold: true, dy: 30 },
-    { text: "------------------------------------------------------------------------------------------------", size: 10, bold: false, dy: 15 },
-    { text: "Candidate Name: " + clean(name), size: 12, bold: true, dy: 20 },
-    { text: "Applied Position: " + clean(position), size: 11, bold: false, dy: 18 },
-    { text: "Email Address: " + clean(email), size: 11, bold: false, dy: 18 },
-    { text: "Phone Number: " + clean(phone), size: 11, bold: false, dy: 18 },
-    { text: "Submission Date: " + clean(date), size: 11, bold: false, dy: 18 },
-    { text: "Portfolio / Profile: " + clean(experience), size: 11, bold: false, dy: 25 },
-    { text: "WHY JOIN / CANDIDATE STATEMENT:", size: 12, bold: true, dy: 20 },
-    { text: clean(message), size: 10, bold: false, dy: 25 },
-  ];
-
-  if (coverLetter && clean(coverLetter) !== "N/A") {
-    lines.push({ text: "COVER LETTER:", size: 12, bold: true, dy: 20 });
-    lines.push({ text: clean(coverLetter), size: 10, bold: false, dy: 20 });
-  }
-
-  let textStream = "BT\n";
-  let currentY = 730;
-  for (const item of lines) {
-    const font = item.bold ? "/F2" : "/F1";
-    textStream += font + " " + item.size + " Tf\n";
-    textStream += "50 " + currentY + " Td\n";
-    textStream += "(" + item.text.replace(/[()]/g, "") + ") Tj\n";
-    textStream += "ET\nBT\n";
-    currentY -= item.dy;
-  }
-  textStream += "ET";
-
-  const streamLen = Buffer.byteLength(textStream, "utf-8");
-
-  const objects = [
-    "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
-    "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
-    "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> >>\nendobj\n",
-    "4 0 obj\n<< /Length " + streamLen + " >>\nstream\n" + textStream + "\nendstream\nendobj\n",
-    "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
-    "6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>\nendobj\n"
-  ];
-
-  let pdf = "%PDF-1.4\n";
-  const offsets = [0];
-  for (const obj of objects) {
-    offsets.push(Buffer.byteLength(pdf, "utf-8"));
-    pdf += obj;
-  }
-  const xrefOffset = Buffer.byteLength(pdf, "utf-8");
-  pdf += "xref\n0 7\n0000000000 65535 f \n";
-  for (let i = 1; i <= 6; i++) {
-    pdf += String(offsets[i]).padStart(10, "0") + " 00000 n \n";
-  }
-  pdf += "trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n" + xrefOffset + "\n%%EOF\n";
-
-  return Buffer.from(pdf, "utf-8");
-};
-
-// Proxy & direct file downloader for candidate resumes (PDF, DOCX, PPT, Base64, Cloudinary, Local, Dynamic fallback)
+// Proxy & direct file downloader for candidate resumes (PDF, DOCX, PPT, Base64, Cloudinary, Local)
 const handleResumeDownload = async (req: any, res: any) => {
   try {
     let rawUrl = (req.query.url as string) || (req.query.file as string) || "";
@@ -450,7 +380,7 @@ const handleResumeDownload = async (req: any, res: any) => {
       (applicant?.resumeFileUrl && applicant.resumeFileUrl.startsWith("http") ? applicant.resumeFileUrl : "") ||
       (rawUrl.startsWith("http") ? rawUrl : "");
 
-    // 2. Serve from Base64 Data URI if available
+    // 2. Serve from Base64 Data URI if available (original document binary)
     if (dataCandidate && dataCandidate.startsWith("data:")) {
       const matches = dataCandidate.match(/^data:(.*?);base64,(.*)$/);
       if (matches && matches.length === 3) {
@@ -462,7 +392,7 @@ const handleResumeDownload = async (req: any, res: any) => {
       }
     }
 
-    // 3. Serve from Cloudinary / Remote HTTP(S) URL if available
+    // 3. Serve from Cloudinary / Remote HTTP(S) URL if available (original uploaded file)
     if (cloudCandidate && (cloudCandidate.startsWith("http://") || cloudCandidate.startsWith("https://"))) {
       let response: any = null;
       try {
@@ -499,7 +429,7 @@ const handleResumeDownload = async (req: any, res: any) => {
       }
     }
 
-    // 4. Serve from local filesystem if file exists on disk
+    // 4. Serve from local filesystem if original file exists on disk
     const fileCandidates: string[] = [];
     if (req.query.file) fileCandidates.push(String(req.query.file));
     if (downloadFileName) fileCandidates.push(downloadFileName);
@@ -525,15 +455,6 @@ const handleResumeDownload = async (req: any, res: any) => {
           return res.sendFile(p);
         }
       }
-    }
-
-    // 5. If applicant exists in DB but physical file was wiped on ephemeral storage (Render), generate summary PDF on the fly
-    if (applicant && (applicant.name || applicant.candidateName || applicant.email)) {
-      const pdfBuffer = generateApplicationSummaryPdf(applicant);
-      const pdfFileName = downloadFileName.endsWith(".pdf") ? downloadFileName : `${downloadFileName}.pdf`;
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(pdfFileName)}"`);
-      return res.send(pdfBuffer);
     }
 
     return res.status(404).json({ success: false, message: "Resume file not found on server storage" });
