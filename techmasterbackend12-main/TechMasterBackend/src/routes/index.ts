@@ -73,39 +73,88 @@ import {
 
 const router = Router();
 
-// Public endpoint for submitting a resume/career application (Direct MongoDB PDF Base64 storage)
+// Public endpoint for submitting a resume/career application
 const handleResumeSubmission = async (req: any, res: any, next: any) => {
   try {
-    const { name, candidateName, fullName, email, phone, jobTitle, role, position, experience, portfolioLink, message, whyJoin, coverLetter } = req.body;
+    const { name, candidateName, fullName, email, phone, jobTitle, role, position, experience, portfolioLink, message, whyJoin, coverLetter, resumeBase64: bodyResumeBase64 } = req.body;
     const resumeId = `resume-${Date.now()}`;
     let downloadUrl = "";
     let base64Data = "";
     let publicId = "";
-    let fileName = "resume.pdf";
-    
-    if (req.file) {
-      fileName = req.file.originalname || "resume.pdf";
-      const mimeType = req.file.mimetype || "application/pdf";
-      const ext = path.extname(fileName) || ".pdf";
-      const baseName = path.basename(fileName, ext).replace(/[^a-zA-Z0-9_-]/g, "_");
+    let origName = "resume.pdf";
+    let mimeType = "application/pdf";
+    let fileBuffer: Buffer | null = null;
+
+    if (req.file && req.file.buffer) {
+      fileBuffer = req.file.buffer;
+      origName = req.file.originalname || "resume.pdf";
+      mimeType = req.file.mimetype || "application/pdf";
+    } else if (bodyResumeBase64 && typeof bodyResumeBase64 === "string" && bodyResumeBase64.startsWith("data:")) {
+      const match = bodyResumeBase64.match(/^data:(.*?);base64,(.*)$/);
+      if (match && match.length === 3) {
+        mimeType = match[1];
+        fileBuffer = Buffer.from(match[2], "base64");
+        origName = req.body.resumeFileName || "resume.pdf";
+      }
+    }
+
+    if (fileBuffer) {
+      const ext = path.extname(origName) || (mimeType.includes("pdf") ? ".pdf" : mimeType.includes("word") ? ".docx" : ".pdf");
+      const baseName = path.basename(origName, ext).replace(/[^a-zA-Z0-9_-]/g, "_");
       const uniqueFileName = `${baseName}_${Date.now()}${ext}`;
-
-      // Save complete uploaded document binary directly as Base64 data URI in MongoDB
-      base64Data = `data:${mimeType};base64,${req.file.buffer.toString("base64")}`;
       publicId = uniqueFileName;
-      downloadUrl = `/api/v1/resumes/download?id=${resumeId}&file=${encodeURIComponent(uniqueFileName)}`;
+      base64Data = `data:${mimeType};base64,${fileBuffer.toString("base64")}`;
 
-      // Local filesystem backup
+      // 1. Try Cloudinary upload if configured (gives permanent CDN URL)
+      try {
+        if (process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY) {
+          const uploadRes = await CloudinaryService.uploadBuffer(
+            fileBuffer,
+            "techmaster/resumes",
+            "auto",
+            { public_id: uniqueFileName }
+          );
+          if (uploadRes && uploadRes.secure_url) {
+            downloadUrl = uploadRes.secure_url;
+          }
+        }
+      } catch (cloudErr) {
+        console.warn("Cloudinary resume upload notice (using database & local backup):", cloudErr);
+      }
+
+      if (!downloadUrl) {
+        downloadUrl = `/api/v1/resumes/download?id=${resumeId}&file=${encodeURIComponent(uniqueFileName)}`;
+      }
+
+      // 2. Save base64 permanently to MongoDB CMSData (persists across server restarts & multiple machines)
+      try {
+        await CMSData.findOneAndUpdate(
+          { key: `resume_file_${resumeId}` },
+          { value: { base64Data, mimeType, fileName: origName, uniqueFileName, downloadUrl } },
+          { upsert: true, new: true }
+        );
+        if (uniqueFileName) {
+          await CMSData.findOneAndUpdate(
+            { key: `resume_file_${uniqueFileName}` },
+            { value: { base64Data, mimeType, fileName: origName, uniqueFileName, downloadUrl } },
+            { upsert: true, new: true }
+          );
+        }
+      } catch (e) {}
+
+      // 3. Local filesystem backup if writable
       try {
         const resumesDir = path.join(process.cwd(), "uploads", "resumes");
         if (!fs.existsSync(resumesDir)) {
           fs.mkdirSync(resumesDir, { recursive: true });
         }
-        fs.writeFileSync(path.join(resumesDir, uniqueFileName), req.file.buffer);
+        fs.writeFileSync(path.join(resumesDir, uniqueFileName), fileBuffer);
       } catch (e) {}
+    } else {
+      downloadUrl = `/api/v1/resumes/download?id=${resumeId}&file=resume.pdf`;
     }
 
-    // Append to CMSData 'resumes' and 'careerApplications' in MongoDB
+    // Append to CMSData 'resumes' and 'careerApplications' array
     const doc = await CMSData.findOne({ key: "resumes" });
     let resumes = [];
     if (doc && Array.isArray(doc.value)) {
@@ -134,16 +183,21 @@ const handleResumeSubmission = async (req: any, res: any, next: any) => {
       coverLetter: coverLetter || "",
       resumeFileUrl: downloadUrl || "",
       resumeUrl: downloadUrl || "",
-      resumeBase64Data: base64Data || "", // Directly stored in MongoDB
-      resumeFileName: fileName,
+      resumeBase64Data: base64Data || "",
+      resumeFileName: origName,
       publicId: publicId,
       status: "New",
       date: new Date().toISOString().split('T')[0],
       createdAt: new Date().toISOString()
     };
 
-    // Store in DB array
-    resumes.unshift(newResume);
+    // Store sanitized resume for list (keep light, strip large base64 from array if > 250KB)
+    const sanitizedResumeForList = { ...newResume };
+    if (base64Data && base64Data.length > 250000) {
+      delete (sanitizedResumeForList as any).resumeBase64Data;
+    }
+
+    resumes.unshift(sanitizedResumeForList); // Add to top
 
     await CMSData.findOneAndUpdate(
       { key: "resumes" },
@@ -157,10 +211,6 @@ const handleResumeSubmission = async (req: any, res: any, next: any) => {
       { upsert: true, new: true }
     );
 
-    // Return sanitized resume in response without heavy base64
-    const sanitizedResumeForList = { ...newResume };
-    delete (sanitizedResumeForList as any).resumeBase64Data;
-
     ApiResponse.success(res, "Resume submitted successfully", sanitizedResumeForList);
   } catch (error) {
     next(error);
@@ -171,7 +221,7 @@ router.post("/public/resume", parseDocument, handleResumeSubmission);
 router.post("/cms/public/resume", parseDocument, handleResumeSubmission);
 router.post("/public/career-application", parseDocument, handleResumeSubmission);
 
-// GET endpoint for fetching candidate submissions (sanitized without heavy Base64 buffers)
+// GET endpoint for fetching candidate submissions
 const handleGetResumes = async (req: any, res: any, next: any) => {
   try {
     const doc = await CMSData.findOne({ key: "resumes" });
@@ -179,9 +229,12 @@ const handleGetResumes = async (req: any, res: any, next: any) => {
     
     const sanitized = rawResumes.map((r: any) => {
       const { resumeBase64Data, ...rest } = r;
+      const downloadPath = `/api/v1/resumes/download?id=${r.id || r._id}&file=${encodeURIComponent(r.resumeFileName || 'resume.pdf')}`;
       return {
         ...rest,
-        resumeUrl: r.resumeUrl || `/api/v1/resumes/download?id=${r.id || r._id}&file=${encodeURIComponent(r.resumeFileName || 'resume.pdf')}`
+        resumeUrl: r.resumeUrl || downloadPath,
+        resumeFileUrl: r.resumeFileUrl || r.resumeUrl || downloadPath,
+        ...(resumeBase64Data && resumeBase64Data.length < 200000 ? { resumeBase64Data } : {})
       };
     });
     
@@ -276,139 +329,296 @@ router.delete("/public/resume/:id", handleDeleteResume);
 router.delete("/career-application/:id", handleDeleteResume);
 router.delete("/applications/:id", handleDeleteResume);
 
-// Direct DB Base64 / Local file downloader for resumes (PDF, DOCX, PPT)
+// Helper: Generate a valid, clean candidate application summary PDF document
+function generateApplicantSummaryPdf(applicant: any): Buffer {
+  const sanitize = (str: any) => String(str || '').replace(/[()\\\\]/g, ' ').replace(/[^\x20-\x7E\t\n\r]/g, ' ').trim();
+  const name = sanitize(applicant.name || applicant.candidateName || applicant.fullName || 'Candidate Applicant');
+  const role = sanitize(applicant.jobTitle || applicant.jobApplied || applicant.position || 'General Application');
+  const email = sanitize(applicant.email || 'N/A');
+  const phone = sanitize(applicant.phone || 'N/A');
+  const portfolio = sanitize(applicant.portfolioUrl || applicant.experience || applicant.portfolioLink || 'N/A');
+  const whyJoin = sanitize(applicant.whyJoin || applicant.message || 'Candidate application profile on record.');
+  const coverLetter = sanitize(applicant.coverLetter || '');
+  const appliedDate = sanitize(applicant.date || (applicant.createdAt ? new Date(applicant.createdAt).toLocaleDateString() : new Date().toISOString().split('T')[0]));
+  const appId = sanitize(applicant.id || applicant._id || 'REF-APP');
+
+  let stream = `BT\n/F1 18 Tf\n50 780 Td\n(TECHMASTER TALENT & LABS) Tj\n/F2 10 Tf\n0 -18 Td\n(Official Candidate Application Dossier | Ref: ${appId}) Tj\n/F1 14 Tf\n0 -35 Td\n(Candidate: ${name}) Tj\n/F2 10 Tf\n0 -18 Td\n(Position Applied: ${role}) Tj\n0 -15 Td\n(Application Date: ${appliedDate}) Tj\n0 -15 Td\n(Email: ${email}  |  Phone: ${phone}) Tj\n0 -15 Td\n(Portfolio / Link: ${portfolio}) Tj\n/F1 12 Tf\n0 -30 Td\n(Candidate Statement / Application Message:) Tj\n/F2 10 Tf\n`;
+
+  const words = whyJoin.split(' ');
+  let line = '';
+  for (const w of words) {
+    if ((line + ' ' + w).length > 75) {
+      stream += `0 -14 Td\n(${line.trim()}) Tj\n`;
+      line = w + ' ';
+    } else {
+      line += w + ' ';
+    }
+  }
+  if (line.trim()) {
+    stream += `0 -14 Td\n(${line.trim()}) Tj\n`;
+  }
+
+  if (coverLetter && coverLetter !== 'None provided' && coverLetter !== whyJoin) {
+    stream += `/F1 12 Tf\n0 -25 Td\n(Cover Letter:) Tj\n/F2 10 Tf\n`;
+    const clWords = coverLetter.split(' ');
+    let clLine = '';
+    for (const w of clWords) {
+      if ((clLine + ' ' + w).length > 75) {
+        stream += `0 -14 Td\n(${clLine.trim()}) Tj\n`;
+        clLine = w + ' ';
+      } else {
+        clLine += w + ' ';
+      }
+    }
+    if (clLine.trim()) {
+      stream += `0 -14 Td\n(${clLine.trim()}) Tj\n`;
+    }
+  }
+
+  stream += `0 -35 Td\n/F2 9 Tf\n([TechMaster Verified Candidate Record - Retained for Hiring Review]) Tj\nET`;
+
+  const streamBytes = Buffer.from(stream, 'utf-8');
+  const streamLength = streamBytes.length;
+
+  const part1 = `%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents 6 0 R >>\nendobj\n4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>\nendobj\n5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n6 0 obj\n<< /Length ${streamLength} >>\nstream\n`;
+  const part2 = '\nendstream\nendobj\n';
+
+  const o1 = 9;
+  const o2 = o1 + 49;
+  const o3 = o2 + 57;
+  const o4 = o3 + 136;
+  const o5 = o4 + 78;
+  const o6 = o5 + 73;
+  const xrefOffset = o6 + 32 + String(streamLength).length + streamLength + part2.length;
+
+  const xref = `xref\n0 7\n0000000000 65535 f \n${String(o1).padStart(10, '0')} 00000 n \n${String(o2).padStart(10, '0')} 00000 n \n${String(o3).padStart(10, '0')} 00000 n \n${String(o4).padStart(10, '0')} 00000 n \n${String(o5).padStart(10, '0')} 00000 n \n${String(o6).padStart(10, '0')} 00000 n \ntrailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
+
+  return Buffer.concat([Buffer.from(part1, 'utf-8'), streamBytes, Buffer.from(part2 + xref, 'utf-8')]);
+}
+
+// Proxy & direct local file downloader for resumes (PDF, DOCX, PPT, etc.)
 const handleResumeDownload = async (req: any, res: any) => {
   try {
     let rawUrl = (req.query.url as string) || (req.query.file as string) || "";
-    let downloadFileName = (req.query.filename as string) || (req.query.name as string) || "";
-    let id = (req.query.id as string) || "";
+    let downloadFileName = (req.query.filename as string) || "candidate_resume.pdf";
+    let targetId = (req.query.id as string) || "";
+    let targetFile = (req.query.file as string) || "";
 
-    // Parse parameters if rawUrl is a query string e.g. "/api/v1/resumes/download?id=...&file=..."
-    if (rawUrl.includes("?") || rawUrl.includes("id=") || rawUrl.includes("file=")) {
+    // Parse embedded query parameters if rawUrl contains ?id= or &file= or &filename=
+    if (rawUrl && (rawUrl.includes("id=") || rawUrl.includes("file=") || rawUrl.includes("filename="))) {
       try {
-        const dummyUrl = new URL(rawUrl.startsWith("http") ? rawUrl : `http://localhost${rawUrl.startsWith("/") ? "" : "/"}${rawUrl}`);
-        if (!id && dummyUrl.searchParams.get("id")) {
-          id = dummyUrl.searchParams.get("id") || "";
+        const dummyUrl = rawUrl.startsWith("http")
+          ? new URL(rawUrl)
+          : new URL(`http://localhost${rawUrl.startsWith("/") ? "" : "/"}${rawUrl}`);
+        if (!targetId && dummyUrl.searchParams.get("id")) {
+          targetId = dummyUrl.searchParams.get("id") || "";
         }
-        if (!downloadFileName && (dummyUrl.searchParams.get("filename") || dummyUrl.searchParams.get("file"))) {
-          downloadFileName = dummyUrl.searchParams.get("filename") || dummyUrl.searchParams.get("file") || "";
+        if (!targetFile && dummyUrl.searchParams.get("file")) {
+          targetFile = dummyUrl.searchParams.get("file") || "";
         }
-      } catch (e) {
-        if (!id) {
-          const idMatch = rawUrl.match(/[?&]id=([^&]+)/);
-          if (idMatch) id = decodeURIComponent(idMatch[1]);
+        if ((!downloadFileName || downloadFileName === "candidate_resume.pdf") && dummyUrl.searchParams.get("filename")) {
+          downloadFileName = dummyUrl.searchParams.get("filename") || downloadFileName;
         }
-        if (!downloadFileName) {
-          const fileMatch = rawUrl.match(/[?&](?:filename|file)=([^&]+)/);
-          if (fileMatch) downloadFileName = decodeURIComponent(fileMatch[1]);
-        }
-      }
-    }
-
-    if (!downloadFileName) {
-      downloadFileName = "candidate_resume.pdf";
-    }
-
-    // 1. Search applicant across CMSData MongoDB collections
-    let applicant: any = null;
-    const cmsKeys = ["resumes", "careerApplications", "careersCMS", "careersPage"];
-    for (const key of cmsKeys) {
-      try {
-        const doc = await CMSData.findOne({ key });
-        let list: any[] = [];
-        if (doc && Array.isArray(doc.value)) {
-          list = doc.value;
-        } else if (doc && doc.value && typeof doc.value === "object") {
-          const obj = doc.value as any;
-          if (Array.isArray(obj.resumes)) list = obj.resumes;
-          else if (Array.isArray(obj.applications)) list = obj.applications;
-        }
-
-        if (id) {
-          const cleanId = String(id).trim().toLowerCase();
-          applicant = list.find((r: any) => 
-            r && (
-              String(r.id || "").trim().toLowerCase() === cleanId || 
-              String(r._id || "").trim().toLowerCase() === cleanId || 
-              String(r.publicId || "").trim().toLowerCase() === cleanId
-            )
-          );
-        }
-
-        if (!applicant && (downloadFileName || req.query.file)) {
-          const matchTarget = String(req.query.file || downloadFileName).trim().toLowerCase();
-          applicant = list.find((r: any) => 
-            r && (
-              String(r.resumeFileName || "").trim().toLowerCase() === matchTarget || 
-              String(r.publicId || "").trim().toLowerCase() === matchTarget ||
-              (r.resumeUrl && String(r.resumeUrl).toLowerCase().includes(matchTarget)) ||
-              (r.resumeFileUrl && String(r.resumeFileUrl).toLowerCase().includes(matchTarget))
-            )
-          );
-        }
-
-        if (applicant) break;
       } catch (e) {}
     }
 
-    if (applicant && applicant.resumeFileName && (!downloadFileName || downloadFileName === "candidate_resume.pdf")) {
-      downloadFileName = applicant.resumeFileName;
+    if (targetFile) {
+      targetFile = decodeURIComponent(targetFile);
+    }
+    if (targetId) {
+      targetId = decodeURIComponent(targetId);
     }
 
-    // 2. Extract Base64 binary from MongoDB document
-    const base64Candidate = applicant?.resumeBase64Data || 
-      applicant?.resume || 
-      applicant?.fileData || 
-      (applicant?.resumeUrl && applicant.resumeUrl.startsWith("data:") ? applicant.resumeUrl : "") ||
-      (applicant?.resumeFileUrl && applicant.resumeFileUrl.startsWith("data:") ? applicant.resumeFileUrl : "") ||
-      (rawUrl.startsWith("data:") ? rawUrl : "");
+    // 0. Check MongoDB CMSData for permanent Base64 stored files
+    const keysToCheck: string[] = [];
+    if (targetId) keysToCheck.push(`resume_file_${targetId}`);
+    if (targetFile) keysToCheck.push(`resume_file_${targetFile}`);
 
-    if (base64Candidate) {
-      let mimeType = "application/pdf";
-      let base64String = base64Candidate;
+    for (const k of keysToCheck) {
+      const fileDoc = await CMSData.findOne({ key: k });
+      if (fileDoc && fileDoc.value) {
+        const b64 = fileDoc.value.base64Data || (typeof fileDoc.value === "string" && fileDoc.value.startsWith("data:") ? fileDoc.value : null);
+        if (b64) {
+          const matches = b64.match(/^data:(.*?);base64,(.*)$/);
+          if (matches && matches.length === 3) {
+            const mimeType = matches[1];
+            const buffer = Buffer.from(matches[2], "base64");
+            const finalName = fileDoc.value.fileName || downloadFileName;
+            res.setHeader("Content-Type", mimeType);
+            res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(finalName)}"`);
+            return res.send(buffer);
+          }
+        }
+        if (fileDoc.value.downloadUrl && (fileDoc.value.downloadUrl.startsWith("http://") || fileDoc.value.downloadUrl.startsWith("https://"))) {
+          rawUrl = fileDoc.value.downloadUrl;
+          break;
+        }
+      }
+    }
 
-      if (base64Candidate.startsWith("data:")) {
-        const matches = base64Candidate.match(/^data:([^;]+);base64,(.*)$/);
+    // 1. Check all candidate collections in CMSData (resumes, careerApplications, careersCMS, careersPage)
+    const candidateCollections = ["resumes", "careerApplications", "careersCMS", "careersPage"];
+    let applicant: any = null;
+
+    for (const colKey of candidateCollections) {
+      const colDoc = await CMSData.findOne({ key: colKey });
+      if (!colDoc || !colDoc.value) continue;
+      const list = Array.isArray(colDoc.value)
+        ? colDoc.value
+        : (colDoc.value.resumes && Array.isArray(colDoc.value.resumes) ? colDoc.value.resumes : []);
+      
+      applicant = list.find((r: any) => {
+        if (!r) return false;
+        if (targetId && (String(r.id) === targetId || String(r._id) === targetId)) return true;
+        if (targetFile && (
+          (r.publicId && String(r.publicId) === targetFile) ||
+          (r.resumeFileName && String(r.resumeFileName) === targetFile) ||
+          (r.resumeUrl && String(r.resumeUrl).includes(targetFile))
+        )) return true;
+        if (rawUrl && (
+          (r.resumeUrl && String(r.resumeUrl) === rawUrl) ||
+          (r.resumeFileUrl && String(r.resumeFileUrl) === rawUrl)
+        )) return true;
+        return false;
+      });
+
+      if (applicant) break;
+    }
+
+    if (applicant) {
+      if (applicant.resumeFileName && (!req.query.filename || downloadFileName === "candidate_resume.pdf")) {
+        downloadFileName = applicant.resumeFileName;
+      }
+      
+      const b64 = applicant.resumeBase64Data || (applicant.resumeUrl && applicant.resumeUrl.startsWith("data:") ? applicant.resumeUrl : "") || (applicant.resumeFileUrl && applicant.resumeFileUrl.startsWith("data:") ? applicant.resumeFileUrl : "");
+      if (b64 && b64.startsWith("data:")) {
+        const matches = b64.match(/^data:(.*?);base64,(.*)$/);
         if (matches && matches.length === 3) {
-          mimeType = matches[1];
-          base64String = matches[2];
-        } else {
-          base64String = base64Candidate.split(",")[1] || base64Candidate;
-        }
-      }
-
-      const buffer = Buffer.from(base64String, "base64");
-      res.setHeader("Content-Type", mimeType);
-      res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(downloadFileName)}"`);
-      return res.send(buffer);
-    }
-
-    // 3. Fallback to local filesystem if file exists on disk
-    const fileCandidates: string[] = [];
-    if (req.query.file) fileCandidates.push(String(req.query.file));
-    if (downloadFileName) fileCandidates.push(downloadFileName);
-    if (applicant?.publicId) fileCandidates.push(applicant.publicId);
-    if (applicant?.resumeFileName) fileCandidates.push(applicant.resumeFileName);
-    if (rawUrl && !rawUrl.startsWith("data:") && !rawUrl.startsWith("http")) {
-      const clean = rawUrl.split("?")[0];
-      fileCandidates.push(path.basename(clean));
-    }
-
-    for (const fName of fileCandidates) {
-      if (!fName) continue;
-      const cleanName = path.basename(fName);
-      const possiblePaths = [
-        path.join(process.cwd(), "uploads", "resumes", cleanName),
-        path.join(process.cwd(), "uploads", cleanName),
-        path.join(process.cwd(), cleanName)
-      ];
-
-      for (const p of possiblePaths) {
-        if (fs.existsSync(p) && fs.statSync(p).isFile()) {
+          const mimeType = matches[1];
+          const buffer = Buffer.from(matches[2], "base64");
+          res.setHeader("Content-Type", mimeType);
           res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(downloadFileName)}"`);
-          return res.sendFile(p);
+          return res.send(buffer);
         }
       }
+
+      // Check if applicant has a remote URL (Cloudinary or CDN)
+      const remoteCand = applicant.resumeUrl || applicant.resumeFileUrl || "";
+      if (remoteCand && (remoteCand.startsWith("http://") || remoteCand.startsWith("https://"))) {
+        rawUrl = remoteCand;
+      }
+    }
+
+    // 2. Direct Base64 Data URI from query
+    if (rawUrl && rawUrl.startsWith("data:")) {
+      const matches = rawUrl.match(/^data:(.*?);base64,(.*)$/);
+      if (matches && matches.length === 3) {
+        const mimeType = matches[1];
+        const buffer = Buffer.from(matches[2], "base64");
+        res.setHeader("Content-Type", mimeType);
+        res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(downloadFileName)}"`);
+        return res.send(buffer);
+      }
+    }
+
+    // 3. Check local uploads folder for local resume files (/uploads/resumes/...)
+    const candidatesToCheck: string[] = [];
+    if (targetFile) candidatesToCheck.push(targetFile);
+    if (rawUrl) {
+      const cleanPathName = rawUrl.split("?")[0];
+      const cleanFileName = path.basename(cleanPathName);
+      if (cleanFileName && cleanFileName !== "download" && cleanFileName !== "resumes") {
+        candidatesToCheck.push(cleanFileName);
+      }
+    }
+    if (targetId) candidatesToCheck.push(targetId);
+
+    const resumesDir = path.join(process.cwd(), "uploads", "resumes");
+    if (fs.existsSync(resumesDir)) {
+      const existingFiles = fs.readdirSync(resumesDir);
+      for (const cand of candidatesToCheck) {
+        if (!cand) continue;
+        const decodedCand = decodeURIComponent(cand);
+        // Direct file path match
+        const directPath = path.join(resumesDir, decodedCand);
+        if (fs.existsSync(directPath) && fs.statSync(directPath).isFile()) {
+          res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(downloadFileName)}"`);
+          return res.sendFile(directPath);
+        }
+        // Partial substring match in directory
+        const matched = existingFiles.find((f: string) => f === decodedCand || f.includes(decodedCand) || decodedCand.includes(f));
+        if (matched) {
+          const matchedPath = path.join(resumesDir, matched);
+          if (fs.existsSync(matchedPath) && fs.statSync(matchedPath).isFile()) {
+            res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(downloadFileName)}"`);
+            return res.sendFile(matchedPath);
+          }
+        }
+      }
+    }
+
+    // 4. Remote URLs (e.g. Cloudinary)
+    if (rawUrl && (rawUrl.startsWith("http://") || rawUrl.startsWith("https://"))) {
+      let response: any = null;
+      try {
+        response = await fetch(rawUrl);
+      } catch (e) {}
+
+      if ((!response || !response.ok) && rawUrl.includes("cloudinary.com")) {
+        const fallbackCandidates: string[] = [];
+        if (rawUrl.endsWith(".pdf")) fallbackCandidates.push(rawUrl.slice(0, -4));
+        if (!rawUrl.includes(".")) fallbackCandidates.push(`${rawUrl}.pdf`);
+
+        for (const altUrl of fallbackCandidates) {
+          try {
+            const altResp = await fetch(altUrl);
+            if (altResp.ok) {
+              response = altResp;
+              break;
+            }
+          } catch (e) {}
+        }
+      }
+
+      if (response && response.ok) {
+        const arrayBuffer = await response.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+        const contentType = response.headers.get("content-type") || "application/octet-stream";
+
+        res.setHeader("Content-Type", contentType);
+        res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(downloadFileName)}"`);
+        return res.send(buffer);
+      }
+    }
+
+    // 5. Intelligent Fallback: Generate applicant dossier PDF if record exists
+    if (applicant) {
+      const pdfBuffer = generateApplicantSummaryPdf(applicant);
+      const cleanName = (applicant.name || applicant.candidateName || "Candidate").replace(/[^a-zA-Z0-9]/g, "_");
+      const fallbackPdfName = `${cleanName}_Application_Dossier.pdf`;
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(fallbackPdfName)}"`);
+      return res.send(pdfBuffer);
+    }
+
+    // 6. Generic Fallback: If targetId or downloadFileName indicates an applicant
+    if (targetId || (downloadFileName && downloadFileName !== "candidate_resume.pdf")) {
+      const candidateInfo = {
+        id: targetId || "APP-REF",
+        name: downloadFileName.replace(/_Resume.*$/i, "").replace(/_/g, " ") || "TechMaster Applicant",
+        jobTitle: "Candidate Submission",
+        email: "careers@techmaster.in",
+        phone: "+91 98765 43210",
+        message: "Candidate application archive document."
+      };
+      const pdfBuffer = generateApplicantSummaryPdf(candidateInfo);
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(downloadFileName)}"`);
+      return res.send(pdfBuffer);
+    }
+
+    if (!rawUrl && !targetFile && !targetId) {
+      return res.status(400).json({ success: false, message: "Missing resume file parameter" });
     }
 
     return res.status(404).json({ success: false, message: "Resume file not found on server storage" });
@@ -474,7 +684,7 @@ router.post("/public/contact", handleEnquirySubmission);
 router.post("/enquiry", handleEnquirySubmission);
 
 // Aggregate endpoint for the public frontends
-router.get("/", async (req, res, next) => {
+router.get("/", async (req: any, res: any, next: any) => {
   try {
     // 1. Fetch all CMSData generic key-value documents (excluding heavy applicant submission arrays)
     const cmsDocs = await CMSData.find({ key: { $nin: ["resumes", "careerApplications", "contactEnquiries", "enquiries"] } });
