@@ -1,0 +1,10 @@
+{
+  "name": "techmasterbackend-root",
+  "version": "1.0.0",
+  "description": "TechMaster Backend Root for Render deployment",
+  "scripts": {
+    "build": "cd techmasterbackend12-main/TechMasterBackend && npm install && npm run build",
+    "start": "cd techmasterbackend12-main/TechMasterBackend && npm start",
+    "render-build": "cd techmasterbackend12-main/TechMasterBackend && npm install && npm run build"
+  }
+}
